@@ -56,8 +56,32 @@ class FitbitOAuth2Implementation(AuthImplementation):
     async def _post(self, data: dict[str, Any]) -> dict[str, Any]:
         session = async_get_clientsession(self.hass)
         try:
-            resp = await session.post(self.token_url, data=data, headers=self._headers)
-            resp.raise_for_status()
+            resp = await session.post(url, data=data, headers=headers)
+    text = await resp.text()
+    if resp.status >= 400:
+        # Fitbit returns JSON like:
+        # {"success": false, "errors":[{"errorType":"invalid_grant","message":"..."}]}
+        detail = text
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict) and "errors" in payload:
+                msgs = [
+                    f'{e.get("errorType","unknown")}: {e.get("message","")}'
+                    for e in payload.get("errors", [])
+                    if isinstance(e, dict)
+                ]
+                detail = "; ".join([m for m in msgs if m]) or text
+        except Exception:
+            pass
+        _LOGGER.error(
+            "Fitbit token endpoint error %s %s: %s",
+            resp.status, resp.reason, detail
+        )
+        # Raise something the config flow can show to the user:
+        raise HomeAssistantError(
+            f"Fitbit OAuth2 error {resp.status} {resp.reason}: {detail}"
+        )
+    return json.loads(text)
         except aiohttp.ClientResponseError as err:
             if _LOGGER.isEnabledFor(logging.DEBUG):
                 try:
