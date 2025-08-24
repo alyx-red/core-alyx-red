@@ -24,48 +24,51 @@ class FitbitOAuth2Implementation(LocalOAuth2Implementation):
     """Local OAuth2 implementation that logs Fitbit's exact error body."""
 
     async def _token_request(self, data: dict[str, str]) -> dict:
-        """Make a token request, preserving Fitbit's error details in logs."""
-        session = async_get_clientsession(self.hass)
+    """Make a token request, preserving Fitbit's error details in logs."""
+    session = async_get_clientsession(self.hass)
 
-        data["client_id"] = self.client_id
-        if self.client_secret:
-            data["client_secret"] = self.client_secret
+    # Fitbit expects HTTP Basic for confidential clients.
+    auth = None
+    data["client_id"] = self.client_id
+    if self.client_secret:
+        auth = BasicAuth(self.client_id, self.client_secret)
+        # Don't send the secret in the body when using Basic
+        data.pop("client_secret", None)
 
-        _LOGGER.debug("Sending token request to %s", self.token_url)
-        resp = await session.post(self.token_url, data=data)
-        text = await resp.text()
+    _LOGGER.debug("Sending token request to %s", self.token_url)
+    resp = await session.post(self.token_url, data=data, auth=auth)
+    text = await resp.text()
 
-        if resp.status >= 400:
-            err_code = None
-            err_msg = None
-            try:
-                body = json.loads(text)
-                if isinstance(body, dict):
-                    # RFC 6749 style
-                    err_code = body.get("error")
-                    err_msg = body.get("error_description") or body.get("error_message")
-                    # Fitbit style: {"errors":[{"errorType":"...","message":"..."}]}
-                    errs = body.get("errors")
-                    if not err_code and isinstance(errs, list) and errs:
-                        first = errs[0] if isinstance(errs[0], dict) else {}
-                        err_code = first.get("errorType") or first.get("error")
-                        err_msg = first.get("message") or err_msg
-                    # Sometimes there's a top-level "message"
-                    if not err_msg and isinstance(body.get("message"), str):
-                        err_msg = body["message"]
-            except Exception:
-                # keep raw text if not JSON
-                pass
+    if resp.status >= 400:
+        err_code = None
+        err_msg = None
+        try:
+            body = json.loads(text)
+            if isinstance(body, dict):
+                # RFC 6749 style
+                err_code = body.get("error")
+                err_msg = body.get("error_description") or body.get("error_message")
+                # Fitbit style: {"errors":[{"errorType":"...","message":"..."}]}
+                errs = body.get("errors")
+                if not err_code and isinstance(errs, list) and errs:
+                    first = errs[0] if isinstance(errs[0], dict) else {}
+                    err_code = first.get("errorType") or first.get("error")
+                    err_msg = first.get("message") or err_msg
+                # Sometimes there's a top-level "message"
+                if not err_msg and isinstance(body.get("message"), str):
+                    err_msg = body["message"]
+        except Exception:
+            pass
 
-            _LOGGER.error(
-                "Token request for %s failed (%s): %s",
-                self.domain,
-                err_code or f"{resp.status} {resp.reason}",
-                err_msg or text,
-            )
-            resp.raise_for_status()
+        _LOGGER.error(
+            "Token request for %s failed (%s): %s",
+            self.domain,
+            err_code or f"{resp.status} {resp.reason}",
+            err_msg or text,
+        )
+        resp.raise_for_status()
 
-        return cast(dict, json.loads(text))
+    return cast(dict, json.loads(text))
 
 
 async def async_get_auth_implementation(
