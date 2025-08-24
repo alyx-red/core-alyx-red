@@ -1,124 +1,81 @@
-"""application_credentials platform the fitbit integration.
+"""Fitbit application credentials + provider-specific OAuth impl."""
+from __future__ import annotations
 
-See https://dev.fitbit.com/build/reference/web-api/authorization/ for additional
-details on Fitbit authorization.
-"""
-
-import base64
-from http import HTTPStatus
+import json
 import logging
-from typing import Any, cast
+from typing import cast
 
-import aiohttp
-
-from homeassistant.components.application_credentials import (
-    AuthImplementation,
-    AuthorizationServer,
-    ClientCredential,
-)
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.components.application_credentials import ClientCredential
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-from .const import CONF_CLIENT_ID, CONF_CLIENT_SECRET, OAUTH2_AUTHORIZE, OAUTH2_TOKEN
-from .exceptions import FitbitApiException, FitbitAuthException
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    AbstractOAuth2Implementation,
+    LocalOAuth2Implementation,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
+AUTH_URL = "https://www.fitbit.com/oauth2/authorize"
+TOKEN_URL = "https://api.fitbit.com/oauth2/token"
 
-class FitbitOAuth2Implementation(AuthImplementation):
-    """Local OAuth2 implementation for Fitbit.
 
-    This implementation is needed to send the client id and secret as a Basic
-    Authorization header.
-    """
+class FitbitOAuth2Implementation(LocalOAuth2Implementation):
+    """Local OAuth2 implementation that logs Fitbit's exact error body."""
 
-    async def async_resolve_external_data(self, external_data: dict[str, Any]) -> dict:
-        """Resolve the authorization code to tokens."""
-        return await self._post(
-            {
-                "grant_type": "authorization_code",
-                "code": external_data["code"],
-                "redirect_uri": external_data["state"]["redirect_uri"],
-            }
-        )
-
-    async def _token_request(self, data: dict) -> dict:
-        """Make a token request."""
-        return await self._post(
-            {
-                **data,
-                CONF_CLIENT_ID: self.client_id,
-                CONF_CLIENT_SECRET: self.client_secret,
-            }
-        )
-
-    async def _post(self, data: dict[str, Any]) -> dict[str, Any]:
+    async def _token_request(self, data: dict[str, str]) -> dict:
+        """Make a token request, preserving Fitbit's error details in logs."""
         session = async_get_clientsession(self.hass)
-        try:
-            resp = await session.post(url, data=data, headers=headers)
-    text = await resp.text()
-    if resp.status >= 400:
-        # Fitbit returns JSON like:
-        # {"success": false, "errors":[{"errorType":"invalid_grant","message":"..."}]}
-        detail = text
-        try:
-            payload = json.loads(text)
-            if isinstance(payload, dict) and "errors" in payload:
-                msgs = [
-                    f'{e.get("errorType","unknown")}: {e.get("message","")}'
-                    for e in payload.get("errors", [])
-                    if isinstance(e, dict)
-                ]
-                detail = "; ".join([m for m in msgs if m]) or text
-        except Exception:
-            pass
-        _LOGGER.error(
-            "Fitbit token endpoint error %s %s: %s",
-            resp.status, resp.reason, detail
-        )
-        # Raise something the config flow can show to the user:
-        raise HomeAssistantError(
-            f"Fitbit OAuth2 error {resp.status} {resp.reason}: {detail}"
-        )
-    return json.loads(text)
-        except aiohttp.ClientResponseError as err:
-            if _LOGGER.isEnabledFor(logging.DEBUG):
-                try:
-                    error_body = await resp.text()
-                except aiohttp.ClientError:
-                    error_body = ""
-                _LOGGER.debug(
-                    "Client response error status=%s, body=%s", err.status, error_body
-                )
-            if err.status == HTTPStatus.UNAUTHORIZED:
-                raise FitbitAuthException(f"Unauthorized error: {err}") from err
-            if err.status == HTTPStatus.BAD_REQUEST:
-                raise FitbitAuthException(f"Bad Request error: {err}") from err
-            raise FitbitApiException(f"Server error response: {err}") from err
-        except aiohttp.ClientError as err:
-            raise FitbitApiException(f"Client connection error: {err}") from err
-        return cast(dict, await resp.json())
 
-    @property
-    def _headers(self) -> dict[str, str]:
-        """Build necessary authorization headers."""
-        basic_auth = base64.b64encode(
-            f"{self.client_id}:{self.client_secret}".encode()
-        ).decode()
-        return {"Authorization": f"Basic {basic_auth}"}
+        data["client_id"] = self.client_id
+        if self.client_secret:
+            data["client_secret"] = self.client_secret
+
+        _LOGGER.debug("Sending token request to %s", self.token_url)
+        resp = await session.post(self.token_url, data=data)
+        text = await resp.text()
+
+        if resp.status >= 400:
+            err_code = None
+            err_msg = None
+            try:
+                body = json.loads(text)
+                if isinstance(body, dict):
+                    # RFC 6749 style
+                    err_code = body.get("error")
+                    err_msg = body.get("error_description") or body.get("error_message")
+                    # Fitbit style: {"errors":[{"errorType":"...","message":"..."}]}
+                    errs = body.get("errors")
+                    if not err_code and isinstance(errs, list) and errs:
+                        first = errs[0] if isinstance(errs[0], dict) else {}
+                        err_code = first.get("errorType") or first.get("error")
+                        err_msg = first.get("message") or err_msg
+                    # Sometimes there's a top-level "message"
+                    if not err_msg and isinstance(body.get("message"), str):
+                        err_msg = body["message"]
+            except Exception:
+                # keep raw text if not JSON
+                pass
+
+            _LOGGER.error(
+                "Token request for %s failed (%s): %s",
+                self.domain,
+                err_code or f"{resp.status} {resp.reason}",
+                err_msg or text,
+            )
+            resp.raise_for_status()
+
+        return cast(dict, json.loads(text))
 
 
 async def async_get_auth_implementation(
     hass: HomeAssistant, auth_domain: str, credential: ClientCredential
-) -> config_entry_oauth2_flow.AbstractOAuth2Implementation:
-    """Return a custom auth implementation."""
+) -> AbstractOAuth2Implementation:
+    """Return the Fitbit-specific OAuth implementation used by the config flow."""
     return FitbitOAuth2Implementation(
         hass,
         auth_domain,
-        credential,
-        AuthorizationServer(
-            authorize_url=OAUTH2_AUTHORIZE,
-            token_url=OAUTH2_TOKEN,
-        ),
+        credential.client_id,
+        credential.client_secret,
+        AUTH_URL,
+        TOKEN_URL,
     )
