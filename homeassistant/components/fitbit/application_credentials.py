@@ -1,4 +1,5 @@
 """Fitbit application credentials + provider-specific OAuth impl."""
+from aiohttp import BasicAuth
 from __future__ import annotations
 
 import json
