@@ -1,85 +1,88 @@
-"""Fitbit application credentials + provider-specific OAuth impl."""
-from __future__ import annotations
+"""Config flow for fitbit."""
 
-import json
+from collections.abc import Mapping
 import logging
-from typing import cast
+from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.components.application_credentials import (
-    ClientCredential,
-    async_get_client_credential,
-)
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.config_entry_oauth2_flow import (
-    LocalOAuth2Implementation,
-    OAuth2Implementation,
-)
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlowResult
+from homeassistant.const import CONF_TOKEN
+from homeassistant.helpers import config_entry_oauth2_flow
 
-from .const import DOMAIN
+from . import api
+from .const import DOMAIN, OAUTH_SCOPES
+from .exceptions import FitbitApiException, FitbitAuthException
 
 _LOGGER = logging.getLogger(__name__)
 
-AUTH_URL = "https://www.fitbit.com/oauth2/authorize"
-TOKEN_URL = "https://api.fitbit.com/oauth2/token"
 
+class OAuth2FlowHandler(
+    config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
+):
+    """Config flow to handle fitbit OAuth2 authentication."""
 
-class FitbitOAuth2Implementation(LocalOAuth2Implementation):
-    """Local OAuth2 implementation that logs Fitbit's exact error body."""
+    DOMAIN = DOMAIN
 
-    async def _token_request(self, data: dict[str, str]) -> dict:
-        """Make a token request, preserving Fitbit's error details in logs."""
-        session = async_get_clientsession(self.hass)
+    @property
+    def logger(self) -> logging.Logger:
+        """Return logger."""
+        return logging.getLogger(__name__)
 
-        data["client_id"] = self.client_id
-        if self.client_secret:
-            data["client_secret"] = self.client_secret
+    @property
+    def extra_authorize_data(self) -> dict[str, str]:
+        """Extra data that needs to be appended to the authorize url."""
+        return {
+            "scope": " ".join(OAUTH_SCOPES),
+            "prompt": "consent" if self.source != SOURCE_REAUTH else "none",
+        }
 
-        _LOGGER.debug("Sending token request to %s", self.token_url)
-        resp = await session.post(self.token_url, data=data)
-        text = await resp.text()
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Perform reauth upon an API authentication error."""
+        return await self.async_step_reauth_confirm()
 
-        if resp.status >= 400:
-            err_code = None
-            err_msg = None
-            try:
-                body = json.loads(text)
-                if isinstance(body, dict):
-                    # RFC 6749 style
-                    err_code = body.get("error")
-                    err_msg = body.get("error_description") or body.get("error_message")
-                    # Fitbit style: {"errors":[{"errorType":"...","message":"..."}]}
-                    errs = body.get("errors")
-                    if not err_code and isinstance(errs, list) and errs:
-                        first = errs[0] if isinstance(errs[0], dict) else {}
-                        err_code = first.get("errorType") or first.get("error")
-                        err_msg = first.get("message") or err_msg
-                    # Sometimes there's a top-level "message"
-                    if not err_msg and isinstance(body.get("message"), str):
-                        err_msg = body["message"]
-            except Exception:
-                # keep raw text if not JSON
-                pass
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm reauth dialog."""
+        if user_input is None:
+            return self.async_show_form(step_id="reauth_confirm")
+        return await self.async_step_user()
 
+    async def async_step_creation(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Create config entry from external data with Fitbit specific error handling."""
+        try:
+            return await super().async_step_creation()
+        except FitbitAuthException as err:
             _LOGGER.error(
-                "Token request for %s failed (%s): %s",
-                self.domain,
-                err_code or f"{resp.status} {resp.reason}",
-                err_msg or text,
+                "Failed to authenticate when creating Fitbit credentials: %s", err
             )
-            resp.raise_for_status()
+            return self.async_abort(reason="invalid_auth")
+        except FitbitApiException as err:
+            _LOGGER.error("Failed to create Fitbit credentials: %s", err)
+            return self.async_abort(reason="cannot_connect")
 
-        return cast(dict, json.loads(text))
+    async def async_oauth_create_entry(self, data: dict[str, Any]) -> ConfigFlowResult:
+        """Create an entry for the flow, or update existing entry."""
 
+        client = api.ConfigFlowFitbitApi(self.hass, data[CONF_TOKEN])
+        try:
+            profile = await client.async_get_user_profile()
+        except FitbitAuthException as err:
+            _LOGGER.error("Failed to authenticate with Fitbit API: %s", err)
+            return self.async_abort(reason="invalid_access_token")
+        except FitbitApiException as err:
+            _LOGGER.error("Failed to fetch user profile for Fitbit API: %s", err)
+            return self.async_abort(reason="cannot_connect")
 
-async def async_get_auth_implementation(hass: HomeAssistant) -> OAuth2Implementation:
-    """Return the Fitbit-specific OAuth implementation used by the config flow."""
-    creds: ClientCredential = await async_get_client_credential(hass, DOMAIN)
-    return FitbitOAuth2Implementation(
-        hass,
-        DOMAIN,
-        creds.client_id,
-        creds.client_secret,
-        AUTH_URL,
-        TOKEN_URL,
-    )
+        await self.async_set_unique_id(profile.encoded_id)
+        if self.source == SOURCE_REAUTH:
+            self._abort_if_unique_id_mismatch(reason="wrong_account")
+            return self.async_update_reload_and_abort(
+                self._get_reauth_entry(), data=data
+            )
+
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(title=profile.display_name, data=data)
