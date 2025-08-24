@@ -15,7 +15,7 @@ import base64
 from collections.abc import Awaitable, Callable
 import hashlib
 from http import HTTPStatus
-import json
+from json import JSONDecodeError
 import logging
 import secrets
 import time
@@ -217,45 +217,31 @@ class LocalOAuth2Implementation(AbstractOAuth2Implementation):
         return {**token, **new_token}
 
     async def _token_request(self, data: dict) -> dict:
-    """Make a token request."""
-    session = async_get_clientsession(self.hass)
+        """Make a token request."""
+        session = async_get_clientsession(self.hass)
 
-    data["client_id"] = self.client_id
+        data["client_id"] = self.client_id
 
-    if self.client_secret:
-        data["client_secret"] = self.client_secret
+        if self.client_secret:
+            data["client_secret"] = self.client_secret
 
-    _LOGGER.debug("Sending token request to %s", self.token_url)
-    resp = await session.post(self.token_url, data=data)
-    text = await resp.text()
-    if resp.status >= 400:
-        err_code = None
-        err_msg = None
-        try:
-            body = json.loads(text)
-            if isinstance(body, dict):
-                # Standard OAuth fields
-                err_code = body.get("error")
-                err_msg = body.get("error_description") or body.get("error_message")
-                # Fitbit-style errors: {"errors":[{"errorType":"...","message":"..."}]}
-                errs = body.get("errors")
-                if not err_code and isinstance(errs, list) and errs:
-                    first = errs[0] if isinstance(errs[0], dict) else {}
-                    err_code = first.get("errorType") or first.get("error")
-                    err_msg = first.get("message") or err_msg
-                # Some providers include a top-level "message"
-                if not err_msg and isinstance(body.get("message"), str):
-                    err_msg = body["message"]
-        except Exception:
-            pass
-        _LOGGER.error(
-            "Token request for %s failed (%s): %s",
-            self.domain,
-            err_code or f"{resp.status} {resp.reason}",
-            err_msg or text,
-        )
+        _LOGGER.debug("Sending token request to %s", self.token_url)
+        resp = await session.post(self.token_url, data=data)
+        if resp.status >= 400:
+            try:
+                error_response = await resp.json()
+            except (ClientError, JSONDecodeError):
+                error_response = {}
+            error_code = error_response.get("error", "unknown")
+            error_description = error_response.get("error_description", "unknown error")
+            _LOGGER.error(
+                "Token request for %s failed (%s): %s",
+                self.domain,
+                error_code,
+                error_description,
+            )
         resp.raise_for_status()
-    return cast(dict, json.loads(text))
+        return cast(dict, await resp.json())
 
 
 class LocalOAuth2ImplementationWithPkce(LocalOAuth2Implementation):
