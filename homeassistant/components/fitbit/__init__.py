@@ -1,4 +1,7 @@
-"""The fitbit component."""
+"""The (custom) fitbit component."""
+import logging
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.warning("✅ Loaded CUSTOM Fitbit integration")
 
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
